@@ -9,7 +9,10 @@
 // late-night radio signal. The product should feel quiet, inevitable,
 // timeless, almost infrastructural — not startupy, noisy, or overbuilt.
 //
-const base = import.meta.env.BASE_URL;
+// BASE_URL is `/` in dev and `/zuluy` (no trailing slash) when
+// GITHUB_PAGES=1. Normalize to no-trailing-slash so callsites can
+// uniformly join with `${base}/...` and get a single slash.
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
 ---
 
 <!doctype html>
@@ -21,15 +24,15 @@ const base = import.meta.env.BASE_URL;
     <meta name="description" content="A timezone guessing puzzle." />
     <meta name="theme-color" content="#0A1628" />
     <meta name="color-scheme" content="dark" />
-    <link rel="icon" type="image/svg+xml" href={`${base}favicon.svg`} />
+    <link rel="icon" type="image/svg+xml" href={`${base}/favicon.svg`} />
     <meta property="og:type" content="website" />
     <meta property="og:title" content="zuluy." />
     <meta property="og:description" content="A timezone guessing puzzle." />
-    <meta property="og:image" content={`${base}og.svg`} />
+    <meta property="og:image" content={`${base}/og.svg`} />
     <meta name="twitter:card" content="summary_large_image" />
     <meta name="twitter:title" content="zuluy." />
     <meta name="twitter:description" content="A timezone guessing puzzle." />
-    <meta name="twitter:image" content={`${base}og.svg`} />
+    <meta name="twitter:image" content={`${base}/og.svg`} />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
@@ -41,7 +44,7 @@ const base = import.meta.env.BASE_URL;
     <main>
       <h1 class="wordmark">zuluy.</h1>
       <p class="utc" id="utc" aria-live="off">00:00:00 UTC</p>
-      <a class="button" href={`${base}puzzle`}>play.</a>
+      <a class="button" href={`${base}/puzzle`}>play.</a>
     </main>
 
     <script is:inline>
