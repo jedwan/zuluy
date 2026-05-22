@@ -1,0 +1,144 @@
+---
+// zuluy homepage.
+//
+// Restraint discipline (see memory/zuluy_aesthetics.md and
+// memory/zuluy_execution_discipline.md):
+//   UTC ticker + wordmark + one button. Nothing else.
+//
+// Reference atmospheres: airport departure board, world clock,
+// late-night radio signal. The product should feel quiet, inevitable,
+// timeless, almost infrastructural — not startupy, noisy, or overbuilt.
+//
+// The button currently has no href target — the puzzle page is the
+// next build task. Wire `href` to `/puzzle` when it lands.
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>zuluy.</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="A timezone guessing puzzle." />
+    <meta name="theme-color" content="#0A1628" />
+    <meta name="color-scheme" content="dark" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="zuluy." />
+    <meta property="og:description" content="A timezone guessing puzzle." />
+    <meta property="og:image" content="/og.svg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="zuluy." />
+    <meta name="twitter:description" content="A timezone guessing puzzle." />
+    <meta name="twitter:image" content="/og.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Spectral:wght@400&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400&display=swap"
+    />
+  </head>
+  <body>
+    <main>
+      <h1 class="wordmark">zuluy.</h1>
+      <p class="utc" id="utc" aria-live="off">00:00:00 UTC</p>
+      <a class="button" href="/puzzle">play.</a>
+    </main>
+
+    <script is:inline>
+      // UTC ticker. Updates every second. No frameworks, no deps.
+      (function () {
+        const el = document.getElementById('utc');
+        if (!el) return;
+        const pad = (n) => String(n).padStart(2, '0');
+        const tick = () => {
+          const d = new Date();
+          el.textContent = `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
+        };
+        tick();
+        // Re-align to the next whole second so the tick stays in phase.
+        const align = 1000 - (Date.now() % 1000);
+        setTimeout(() => {
+          tick();
+          setInterval(tick, 1000);
+        }, align);
+      })();
+    </script>
+
+    <style>
+      :root {
+        --midnight: #0A1628;
+        --sunrise: #F4A261;
+        --white: #F5F1EA;
+        --muted: rgba(245, 241, 234, 0.55);
+      }
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        background: var(--midnight);
+        color: var(--white);
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+      }
+      main {
+        min-height: 100vh;
+        min-height: 100svh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 2.25rem;
+        padding: 2rem;
+      }
+      .wordmark {
+        font-family: 'Spectral', Georgia, 'Times New Roman', serif;
+        font-weight: 400;
+        font-size: clamp(4rem, 13vw, 7.5rem);
+        color: var(--sunrise);
+        letter-spacing: -0.02em;
+        line-height: 1;
+      }
+      .utc {
+        font-family: 'JetBrains Mono', ui-monospace, 'Cascadia Code', Consolas, monospace;
+        font-size: clamp(0.95rem, 2vw, 1.1rem);
+        color: var(--muted);
+        letter-spacing: 0.08em;
+        font-variant-numeric: tabular-nums;
+      }
+      .button {
+        font-family: 'Inter', system-ui, sans-serif;
+        font-size: clamp(0.95rem, 2vw, 1.05rem);
+        color: var(--white);
+        background: transparent;
+        border: 1px solid rgba(244, 162, 97, 0.35);
+        padding: 0.85rem 1.5rem;
+        border-radius: 2px;
+        text-decoration: none;
+        letter-spacing: 0.02em;
+        transition: border-color 200ms ease, background-color 200ms ease;
+        cursor: pointer;
+      }
+      .button:hover,
+      .button:focus-visible {
+        border-color: var(--sunrise);
+        background-color: rgba(244, 162, 97, 0.07);
+        outline: none;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .button {
+          transition: none;
+        }
+      }
+    </style>
+  </body>
+</html>

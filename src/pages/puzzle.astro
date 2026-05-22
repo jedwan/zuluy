@@ -1,0 +1,998 @@
+---
+// /puzzle — the unlimited timezone puzzle session.
+//
+// Post-pivot (2026-05-22): unlimited puzzles. Each completed puzzle pushes
+// a card into the history list below. Recent picks are excluded for ~30
+// games so the player doesn't see the same city twice in a row.
+//
+// State model:
+//   • In-flight game state is in-memory only (refresh → fresh puzzle).
+//   • History (completed games) persists in localStorage, capped at 50.
+//   • Aggregate stats (gamesPlayed, wins, streak) persist in localStorage.
+//
+// See memory/zuluy_pivot_unlimited.md for the rationale behind dropping
+// the daily-puzzle model.
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>zuluy.</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="A timezone guessing puzzle." />
+    <meta name="theme-color" content="#0A1628" />
+    <meta name="color-scheme" content="dark" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="zuluy." />
+    <meta property="og:description" content="A timezone guessing puzzle." />
+    <meta property="og:image" content="/og.svg" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="zuluy." />
+    <meta name="twitter:description" content="A timezone guessing puzzle." />
+    <meta name="twitter:image" content="/og.svg" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Spectral:wght@400&family=Inter:wght@400;500&family=JetBrains+Mono:wght@400&display=swap"
+    />
+  </head>
+  <body>
+    <a class="back" href="/">zuluy.</a>
+    <button class="help" type="button" id="help-button" aria-label="How to play">?</button>
+
+    <dialog class="modal" id="howto-modal" aria-labelledby="howto-title">
+      <div class="modal-panel">
+        <h2 class="modal-title" id="howto-title">zuluy.</h2>
+        <p class="modal-body">five guesses to find the city whose local time you see above.</p>
+        <p class="modal-body">after each, you'll see how far and which direction.</p>
+        <p class="modal-body">play as many as you like. completed games stack below.</p>
+        <button class="modal-button" id="howto-dismiss" type="button" autofocus>begin.</button>
+      </div>
+    </dialog>
+
+    <main>
+      <section class="prompt-block">
+        <p class="eyebrow">it is right now in a city.</p>
+        <h1 class="prompt" id="prompt" aria-live="off">—</h1>
+        <p class="question">where on Earth?</p>
+      </section>
+
+      <section class="game">
+        <div class="typeahead">
+          <form class="guess-form" id="guess-form">
+            <input
+              class="guess-input"
+              id="guess-input"
+              type="text"
+              autocomplete="off"
+              autocorrect="off"
+              spellcheck="false"
+              placeholder="a city, anywhere"
+              role="combobox"
+              aria-autocomplete="list"
+              aria-controls="suggestions"
+              aria-expanded="false"
+            />
+          </form>
+          <ul class="suggestions" id="suggestions" role="listbox" hidden></ul>
+        </div>
+
+        <ol class="slots" id="slots" aria-label="Guesses">
+          <li class="slot" data-i="0"></li>
+          <li class="slot" data-i="1"></li>
+          <li class="slot" data-i="2"></li>
+          <li class="slot" data-i="3"></li>
+          <li class="slot" data-i="4"></li>
+        </ol>
+
+        <p class="status" id="status" aria-live="polite"></p>
+        <p class="reveal" id="reveal" hidden></p>
+        <p class="stats" id="stats" hidden></p>
+        <div class="end-actions" id="end-actions" hidden>
+          <button class="action share" id="share" type="button">share.</button>
+          <button class="action next" id="next" type="button">next.</button>
+        </div>
+        <p class="share-feedback" id="share-feedback" aria-live="polite"></p>
+      </section>
+
+      <section class="history" id="history" aria-label="Past puzzles"></section>
+      <button class="clear-history" id="clear-history" type="button" hidden>clear history.</button>
+    </main>
+
+    <script>
+      import type { City } from '../lib/types';
+      import { pickRandomCity, formatLocalTimePrompt } from '../lib/puzzle';
+      import { normalizeSearchTerm, scoreCity } from '../lib/search';
+      import { haversineKm, bearingDegrees, compassPoint } from '../lib/geo';
+      import { buildShareGrid, buildGridRows } from '../lib/share';
+      import { recordGameEnd, loadStats, formatStatsLine } from '../lib/stats';
+
+      // ── DOM ─────────────────────────────────────────────────────────────
+      const promptEl = document.getElementById('prompt') as HTMLElement;
+      const formEl = document.getElementById('guess-form') as HTMLFormElement;
+      const inputEl = document.getElementById('guess-input') as HTMLInputElement;
+      const suggestionsEl = document.getElementById('suggestions') as HTMLUListElement;
+      const slotsEl = document.getElementById('slots') as HTMLOListElement;
+      const statusEl = document.getElementById('status') as HTMLElement;
+      const revealEl = document.getElementById('reveal') as HTMLElement;
+      const statsEl = document.getElementById('stats') as HTMLElement;
+      const endActionsEl = document.getElementById('end-actions') as HTMLElement;
+      const shareEl = document.getElementById('share') as HTMLButtonElement;
+      const nextEl = document.getElementById('next') as HTMLButtonElement;
+      const shareFeedbackEl = document.getElementById('share-feedback') as HTMLElement;
+      const historyEl = document.getElementById('history') as HTMLElement;
+      const helpEl = document.getElementById('help-button') as HTMLButtonElement;
+      const modalEl = document.getElementById('howto-modal') as HTMLDialogElement;
+      const dismissEl = document.getElementById('howto-dismiss') as HTMLButtonElement;
+      const clearHistoryEl = document.getElementById('clear-history') as HTMLButtonElement;
+
+      // ── constants & state ──────────────────────────────────────────────
+      const MAX_GUESSES = 5;
+      const RECENT_MAX = 30;
+      const HISTORY_KEY = 'zuluy.history';
+      const HOWTO_KEY = 'zuluy.howto.seen';
+      const MAX_HISTORY = 50;
+
+      type GameStatus = 'playing' | 'won' | 'lost';
+      interface HistoryEntry {
+        cityName: string;
+        countryName: string;
+        status: 'won' | 'lost';
+        guessCount: number;
+        rows: string[];
+      }
+
+      let cities: City[] = [];
+      let answer: City | null = null;
+      let guesses: City[] = [];
+      let status: GameStatus = 'playing';
+      let history: HistoryEntry[] = [];
+      const recentIds: string[] = [];
+      let suggestionPool: City[] = [];
+      let activeSuggestion = -1;
+      let minuteIntervalId: number | null = null;
+
+      // ── time prompt ─────────────────────────────────────────────────────
+      function renderPrompt() {
+        if (!answer) return;
+        promptEl.textContent = formatLocalTimePrompt(answer.tz, new Date());
+      }
+      function scheduleMinuteTicker() {
+        const now = new Date();
+        const msToNextMinute = 60_000 - (now.getSeconds() * 1000 + now.getMilliseconds());
+        setTimeout(() => {
+          renderPrompt();
+          minuteIntervalId = window.setInterval(renderPrompt, 60_000);
+        }, msToNextMinute);
+      }
+
+      // ── typeahead ───────────────────────────────────────────────────────
+      function search(q: string, limit = 6): City[] {
+        const qNorm = normalizeSearchTerm(q);
+        if (!qNorm) return [];
+        const guessedIds = new Set(guesses.map((g) => g.id));
+        return cities
+          .filter((c) => !guessedIds.has(c.id))
+          .map((c) => ({ c, s: scoreCity(c, qNorm) }))
+          .filter((r) => r.s > 0)
+          .sort((a, b) => b.s - a.s)
+          .slice(0, limit)
+          .map((r) => r.c);
+      }
+
+      function renderSuggestions() {
+        suggestionsEl.innerHTML = '';
+        if (suggestionPool.length === 0) {
+          suggestionsEl.hidden = true;
+          inputEl.setAttribute('aria-expanded', 'false');
+          inputEl.removeAttribute('aria-activedescendant');
+          return;
+        }
+        suggestionsEl.hidden = false;
+        inputEl.setAttribute('aria-expanded', 'true');
+        suggestionPool.forEach((c, i) => {
+          const li = document.createElement('li');
+          li.className = 'suggestion';
+          li.setAttribute('role', 'option');
+          li.id = `sug-${i}`;
+          li.setAttribute('aria-selected', String(i === activeSuggestion));
+          const name = document.createElement('span');
+          name.className = 's-name';
+          name.textContent = c.name;
+          const country = document.createElement('span');
+          country.className = 's-country';
+          country.textContent = c.countryName;
+          li.append(name, country);
+          li.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            submitGuess(c);
+          });
+          suggestionsEl.append(li);
+        });
+        if (activeSuggestion >= 0) {
+          inputEl.setAttribute('aria-activedescendant', `sug-${activeSuggestion}`);
+        }
+      }
+
+      function clearSuggestions() {
+        suggestionPool = [];
+        activeSuggestion = -1;
+        renderSuggestions();
+      }
+
+      function updateSuggestions() {
+        suggestionPool = search(inputEl.value);
+        activeSuggestion = suggestionPool.length > 0 ? 0 : -1;
+        renderSuggestions();
+      }
+
+      // ── guess submission ─────────────────────────────────────────────────
+      function submitGuess(city: City) {
+        if (status !== 'playing') return;
+        if (guesses.some((g) => g.id === city.id)) {
+          statusEl.textContent = 'already tried that one.';
+          return;
+        }
+        guesses.push(city);
+        renderGuessSlot(guesses.length - 1, city);
+        inputEl.value = '';
+        clearSuggestions();
+        statusEl.textContent = '';
+        if (city.id === answer!.id) {
+          status = 'won';
+          handleWin();
+        } else if (guesses.length >= MAX_GUESSES) {
+          status = 'lost';
+          handleLoss();
+        }
+      }
+
+      function formatKm(km: number): string {
+        if (km < 10) return `${km.toFixed(1)} km`;
+        return `${Math.round(km).toLocaleString('en-US')} km`;
+      }
+
+      function renderGuessSlot(i: number, city: City) {
+        const slot = slotsEl.querySelector(`[data-i="${i}"]`) as HTMLLIElement | null;
+        if (!slot || !answer) return;
+        const km = haversineKm(city.lat, city.lng, answer.lat, answer.lng);
+        const bearing = bearingDegrees(city.lat, city.lng, answer.lat, answer.lng);
+        const compass = compassPoint(bearing);
+        const isHit = city.id === answer.id;
+
+        slot.classList.add('filled');
+        if (isHit) slot.classList.add('hit');
+        slot.innerHTML = '';
+
+        const name = document.createElement('span');
+        name.className = 'g-name';
+        name.textContent = `${city.name}, ${city.countryName}`;
+
+        const dist = document.createElement('span');
+        dist.className = 'g-distance';
+        dist.textContent = isHit ? '0 km' : formatKm(km);
+
+        const arrow = document.createElement('span');
+        arrow.className = 'g-arrow';
+        arrow.setAttribute('aria-label', isHit ? 'exact match' : compass.toLowerCase());
+        arrow.style.transform = `rotate(${bearing}deg)`;
+        arrow.textContent = isHit ? '◎' : '↑';
+        if (isHit) arrow.style.transform = '';
+
+        slot.append(name, dist, arrow);
+      }
+
+      function handleWin() {
+        const n = guesses.length;
+        statusEl.textContent = n === 1 ? 'uncanny.' : n <= 3 ? 'well done.' : 'got it.';
+        recordGameEnd('won', n);
+        endGame();
+      }
+
+      function handleLoss() {
+        statusEl.textContent = 'tomorrow… or now.';
+        if (answer) revealEl.textContent = `the city was ${answer.name}, ${answer.countryName}.`;
+        revealEl.hidden = false;
+        recordGameEnd('lost', guesses.length);
+        endGame();
+      }
+
+      function endGame() {
+        inputEl.disabled = true;
+        inputEl.blur();
+        formEl.classList.add('done');
+        clearSuggestions();
+        const line = formatStatsLine(loadStats());
+        if (line) {
+          statsEl.textContent = line;
+          statsEl.hidden = false;
+        }
+        endActionsEl.hidden = false;
+        nextEl.focus();
+      }
+
+      async function handleShare() {
+        if (!answer || status === 'playing') return;
+        const text = buildShareGrid(answer, guesses, status);
+        try {
+          await navigator.clipboard.writeText(text);
+          shareFeedbackEl.textContent = 'copied.';
+        } catch {
+          const ta = document.createElement('textarea');
+          ta.value = text;
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          document.body.appendChild(ta);
+          ta.select();
+          try {
+            document.execCommand('copy');
+            shareFeedbackEl.textContent = 'copied.';
+          } catch {
+            shareFeedbackEl.textContent = 'copy failed.';
+          }
+          document.body.removeChild(ta);
+        }
+        setTimeout(() => {
+          shareFeedbackEl.textContent = '';
+        }, 2400);
+      }
+
+      // ── history ─────────────────────────────────────────────────────────
+      function loadHistory(): HistoryEntry[] {
+        try {
+          const raw = localStorage.getItem(HISTORY_KEY);
+          return raw ? (JSON.parse(raw) as HistoryEntry[]) : [];
+        } catch {
+          return [];
+        }
+      }
+
+      function saveHistory() {
+        try {
+          localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, MAX_HISTORY)));
+        } catch {
+          /* storage off */
+        }
+      }
+
+      function captureHistoryEntry(): HistoryEntry | null {
+        if (!answer || status === 'playing') return null;
+        return {
+          cityName: answer.name,
+          countryName: answer.countryName,
+          status,
+          guessCount: guesses.length,
+          rows: buildGridRows(answer, guesses),
+        };
+      }
+
+      function renderHistoryCard(entry: HistoryEntry, prepend = false) {
+        const card = document.createElement('article');
+        card.className = `card ${entry.status}`;
+
+        const header = document.createElement('header');
+        header.className = 'card-header';
+        const city = document.createElement('span');
+        city.className = 'card-city';
+        city.textContent = `${entry.cityName}, ${entry.countryName}`;
+        const result = document.createElement('span');
+        result.className = 'card-result';
+        result.textContent = entry.status === 'won' ? `${entry.guessCount}/${MAX_GUESSES}` : `X/${MAX_GUESSES}`;
+        header.append(city, result);
+
+        const grid = document.createElement('div');
+        grid.className = 'card-grid';
+        for (const row of entry.rows) {
+          const span = document.createElement('span');
+          span.textContent = row;
+          grid.append(span);
+        }
+
+        card.append(header, grid);
+        if (prepend) historyEl.prepend(card);
+        else historyEl.append(card);
+      }
+
+      function renderHistoryAll() {
+        historyEl.innerHTML = '';
+        for (const entry of history) renderHistoryCard(entry);
+        updateClearHistoryVisibility();
+      }
+
+      function updateClearHistoryVisibility() {
+        clearHistoryEl.hidden = history.length === 0;
+      }
+
+      function clearAllHistory() {
+        history = [];
+        try {
+          localStorage.removeItem(HISTORY_KEY);
+        } catch {
+          /* storage off */
+        }
+        historyEl.innerHTML = '';
+        updateClearHistoryVisibility();
+        if (status === 'playing') inputEl.focus();
+      }
+
+      // ── new puzzle ──────────────────────────────────────────────────────
+      function resetUiForNextPuzzle() {
+        guesses = [];
+        status = 'playing';
+        // Clear slots
+        slotsEl.querySelectorAll('.slot').forEach((slot) => {
+          slot.classList.remove('filled', 'hit');
+          slot.innerHTML = '';
+        });
+        statusEl.textContent = '';
+        revealEl.hidden = true;
+        revealEl.textContent = '';
+        statsEl.hidden = true;
+        statsEl.textContent = '';
+        endActionsEl.hidden = true;
+        shareFeedbackEl.textContent = '';
+        inputEl.disabled = false;
+        inputEl.value = '';
+        formEl.classList.remove('done');
+        clearSuggestions();
+      }
+
+      function startNewPuzzle() {
+        if (cities.length === 0) return;
+        const exclude = new Set(recentIds);
+        answer = pickRandomCity(cities, 6, exclude);
+        recentIds.push(answer.id);
+        if (recentIds.length > RECENT_MAX) recentIds.shift();
+        renderPrompt();
+        inputEl.focus();
+      }
+
+      function nextPuzzle() {
+        // Capture current game into history before starting fresh.
+        const entry = captureHistoryEntry();
+        if (entry) {
+          history.unshift(entry);
+          if (history.length > MAX_HISTORY) history.length = MAX_HISTORY;
+          saveHistory();
+          renderHistoryCard(entry, true);
+          updateClearHistoryVisibility();
+        }
+        resetUiForNextPuzzle();
+        startNewPuzzle();
+      }
+
+      // ── how-to modal ────────────────────────────────────────────────────
+      function showHowto() {
+        if (!modalEl.open) modalEl.showModal();
+      }
+      function hideHowto() {
+        if (modalEl.open) modalEl.close();
+        try {
+          localStorage.setItem(HOWTO_KEY, '1');
+        } catch {
+          /* storage off */
+        }
+        if (status === 'playing') inputEl.focus();
+      }
+      helpEl.addEventListener('click', showHowto);
+      dismissEl.addEventListener('click', hideHowto);
+      modalEl.addEventListener('click', (e) => {
+        if (e.target === modalEl) hideHowto();
+      });
+      modalEl.addEventListener('close', () => {
+        try {
+          localStorage.setItem(HOWTO_KEY, '1');
+        } catch {
+          /* storage off */
+        }
+      });
+
+      // ── events ──────────────────────────────────────────────────────────
+      inputEl.addEventListener('input', () => updateSuggestions());
+
+      inputEl.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          if (suggestionPool.length === 0) return;
+          activeSuggestion = (activeSuggestion + 1) % suggestionPool.length;
+          renderSuggestions();
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          if (suggestionPool.length === 0) return;
+          activeSuggestion = (activeSuggestion - 1 + suggestionPool.length) % suggestionPool.length;
+          renderSuggestions();
+        } else if (e.key === 'Escape') {
+          clearSuggestions();
+        }
+      });
+
+      formEl.addEventListener('submit', (e) => {
+        e.preventDefault();
+        if (status !== 'playing') return;
+        const pick = suggestionPool[activeSuggestion >= 0 ? activeSuggestion : 0];
+        if (pick) submitGuess(pick);
+      });
+
+      document.addEventListener('click', (e) => {
+        if (!suggestionsEl.contains(e.target as Node) && e.target !== inputEl) {
+          clearSuggestions();
+        }
+      });
+
+      shareEl.addEventListener('click', handleShare);
+      nextEl.addEventListener('click', nextPuzzle);
+      clearHistoryEl.addEventListener('click', clearAllHistory);
+
+      // ── boot ────────────────────────────────────────────────────────────
+      async function main() {
+        try {
+          const res = await fetch(`${import.meta.env.BASE_URL}cities.json`);
+          if (!res.ok) throw new Error(`fetch /cities.json failed: ${res.status}`);
+          cities = (await res.json()) as City[];
+          history = loadHistory();
+          renderHistoryAll();
+          startNewPuzzle();
+          scheduleMinuteTicker();
+          let howtoSeen = false;
+          try {
+            howtoSeen = !!localStorage.getItem(HOWTO_KEY);
+          } catch {
+            howtoSeen = true;
+          }
+          if (!howtoSeen) showHowto();
+        } catch (err) {
+          console.error(err);
+          statusEl.textContent = 'something is broken. try again.';
+        }
+      }
+
+      main();
+    </script>
+
+    <style is:global>
+      :root {
+        --midnight: #0A1628;
+        --sunrise: #F4A261;
+        --white: #F5F1EA;
+        --muted: rgba(245, 241, 234, 0.55);
+        --faint: rgba(244, 162, 97, 0.12);
+        --hairline: rgba(244, 162, 97, 0.3);
+      }
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        background: var(--midnight);
+        color: var(--white);
+        font-family: 'Inter', system-ui, -apple-system, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+      }
+      .back {
+        position: absolute;
+        top: 1.5rem;
+        left: 1.75rem;
+        font-family: 'Spectral', Georgia, serif;
+        font-size: 1.25rem;
+        color: var(--muted);
+        text-decoration: none;
+        letter-spacing: -0.01em;
+        transition: color 200ms ease;
+        z-index: 5;
+      }
+      .back:hover,
+      .back:focus-visible {
+        color: var(--sunrise);
+        outline: none;
+      }
+      .help {
+        position: absolute;
+        top: 1.5rem;
+        right: 1.75rem;
+        font-family: 'Spectral', Georgia, serif;
+        font-size: 1.25rem;
+        color: var(--muted);
+        background: transparent;
+        border: none;
+        cursor: pointer;
+        padding: 0;
+        letter-spacing: -0.01em;
+        transition: color 200ms ease;
+        line-height: 1;
+        z-index: 5;
+      }
+      .help:hover,
+      .help:focus-visible {
+        color: var(--sunrise);
+        outline: none;
+      }
+      .modal[open] {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        max-width: none;
+        max-height: none;
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        border: none;
+        color: var(--white);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+      .modal:not([open]) {
+        display: none;
+      }
+      .modal::backdrop {
+        background-color: rgba(10, 22, 40, 0.92);
+      }
+      .modal-panel {
+        background: var(--midnight);
+        border: 1px solid var(--hairline);
+        padding: 2.5rem 2rem;
+        max-width: 22rem;
+        width: calc(100vw - 2rem);
+        text-align: center;
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+        font-family: 'Inter', system-ui, sans-serif;
+      }
+      .modal-title {
+        font-family: 'Spectral', Georgia, serif;
+        font-size: 2rem;
+        font-weight: 400;
+        color: var(--sunrise);
+        letter-spacing: -0.02em;
+        margin-bottom: 0.5rem;
+        line-height: 1;
+      }
+      .modal-body {
+        font-size: 0.95rem;
+        color: var(--white);
+        line-height: 1.55;
+        letter-spacing: 0.01em;
+      }
+      .modal-button {
+        align-self: center;
+        margin-top: 1rem;
+        font-family: 'Inter', system-ui, sans-serif;
+        font-size: 1rem;
+        color: var(--white);
+        background: transparent;
+        border: 1px solid var(--hairline);
+        padding: 0.75rem 2rem;
+        border-radius: 2px;
+        letter-spacing: 0.02em;
+        cursor: pointer;
+        transition: border-color 200ms ease, background-color 200ms ease;
+      }
+      .modal-button:hover,
+      .modal-button:focus-visible {
+        border-color: var(--sunrise);
+        background-color: rgba(244, 162, 97, 0.07);
+        outline: none;
+      }
+      main {
+        min-height: 100vh;
+        min-height: 100svh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 2.5rem;
+        padding: 4rem 1.5rem 4rem;
+      }
+      .prompt-block {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 0.75rem;
+        margin-top: 2rem;
+      }
+      .eyebrow {
+        font-size: clamp(0.85rem, 1.8vw, 0.95rem);
+        color: var(--muted);
+        letter-spacing: 0.04em;
+        text-align: center;
+      }
+      .prompt {
+        font-family: 'Spectral', Georgia, 'Times New Roman', serif;
+        font-weight: 400;
+        font-size: clamp(4.5rem, 14vw, 8rem);
+        color: var(--sunrise);
+        letter-spacing: -0.02em;
+        line-height: 1;
+        font-variant-numeric: tabular-nums;
+        text-align: center;
+      }
+      .question {
+        font-size: clamp(0.95rem, 2vw, 1.1rem);
+        color: var(--muted);
+        text-align: center;
+      }
+      .game {
+        width: 100%;
+        max-width: 26rem;
+        display: flex;
+        flex-direction: column;
+        gap: 1.25rem;
+      }
+      .typeahead {
+        position: relative;
+      }
+      .guess-input {
+        width: 100%;
+        background: transparent;
+        border: none;
+        border-bottom: 1px solid var(--hairline);
+        color: var(--white);
+        font-family: 'Inter', system-ui, sans-serif;
+        font-size: clamp(1rem, 2.4vw, 1.1rem);
+        padding: 0.65rem 0.25rem;
+        text-align: center;
+        outline: none;
+        transition: border-color 200ms ease;
+        letter-spacing: 0.02em;
+      }
+      .guess-input::placeholder {
+        color: var(--muted);
+      }
+      .guess-input:focus {
+        border-bottom-color: var(--sunrise);
+      }
+      .guess-input:disabled {
+        opacity: 0.4;
+      }
+      .guess-form.done {
+        display: none;
+      }
+      .suggestions {
+        list-style: none;
+        position: absolute;
+        top: calc(100% + 0.35rem);
+        left: 0;
+        right: 0;
+        background: var(--midnight);
+        border: 1px solid rgba(244, 162, 97, 0.25);
+        max-height: 16rem;
+        overflow-y: auto;
+        z-index: 10;
+      }
+      .suggestion {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 1rem;
+        padding: 0.6rem 0.85rem;
+        cursor: pointer;
+        font-size: 0.95rem;
+      }
+      .suggestion[aria-selected='true'],
+      .suggestion:hover {
+        background: rgba(244, 162, 97, 0.08);
+        color: var(--sunrise);
+      }
+      .s-name {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .s-country {
+        color: var(--muted);
+        font-size: 0.85rem;
+        flex-shrink: 0;
+      }
+      .suggestion[aria-selected='true'] .s-country,
+      .suggestion:hover .s-country {
+        color: rgba(244, 162, 97, 0.7);
+      }
+      .slots {
+        list-style: none;
+        display: flex;
+        flex-direction: column;
+      }
+      .slot {
+        width: 100%;
+        height: 2.75rem;
+        border-bottom: 1px solid var(--faint);
+        display: flex;
+        align-items: center;
+        gap: 0.75rem;
+        padding: 0 0.25rem;
+        color: var(--muted);
+        font-size: 0.95rem;
+      }
+      .slot.filled {
+        color: var(--white);
+        border-bottom-color: var(--hairline);
+      }
+      .slot.hit {
+        color: var(--sunrise);
+      }
+      .g-name {
+        flex: 1;
+        min-width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .g-distance {
+        font-family: 'JetBrains Mono', ui-monospace, 'Cascadia Code', Consolas, monospace;
+        font-size: 0.85rem;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+        font-variant-numeric: tabular-nums;
+        flex-shrink: 0;
+      }
+      .slot.hit .g-distance {
+        color: var(--sunrise);
+      }
+      .g-arrow {
+        display: inline-block;
+        width: 1.5em;
+        text-align: center;
+        font-size: 1.1em;
+        color: var(--sunrise);
+        flex-shrink: 0;
+        line-height: 1;
+      }
+      .status {
+        font-size: 0.95rem;
+        color: var(--sunrise);
+        text-align: center;
+        min-height: 1.4em;
+        letter-spacing: 0.02em;
+      }
+      .reveal {
+        font-size: 0.95rem;
+        color: var(--muted);
+        text-align: center;
+        font-style: italic;
+        letter-spacing: 0.01em;
+      }
+      .stats {
+        font-family: 'JetBrains Mono', ui-monospace, monospace;
+        font-size: 0.85rem;
+        color: var(--muted);
+        text-align: center;
+        letter-spacing: 0.04em;
+        margin-top: 0.25rem;
+      }
+      .end-actions {
+        display: flex;
+        gap: 0.75rem;
+        justify-content: center;
+        margin-top: 0.5rem;
+      }
+      .end-actions[hidden] {
+        display: none;
+      }
+      .card-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: baseline;
+        gap: 1rem;
+      }
+      .action {
+        font-family: 'Inter', system-ui, sans-serif;
+        font-size: clamp(0.95rem, 2vw, 1.05rem);
+        color: var(--white);
+        background: transparent;
+        border: 1px solid var(--hairline);
+        padding: 0.7rem 1.4rem;
+        border-radius: 2px;
+        letter-spacing: 0.02em;
+        cursor: pointer;
+        transition: border-color 200ms ease, background-color 200ms ease;
+      }
+      .action:hover,
+      .action:focus-visible {
+        border-color: var(--sunrise);
+        background-color: rgba(244, 162, 97, 0.07);
+        outline: none;
+      }
+      .action.next {
+        color: var(--sunrise);
+      }
+      .share-feedback {
+        font-size: 0.85rem;
+        color: var(--sunrise);
+        text-align: center;
+        min-height: 1.2em;
+        letter-spacing: 0.04em;
+      }
+      .history {
+        width: 100%;
+        max-width: 26rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.85rem;
+        margin-top: 1.5rem;
+      }
+      .history:empty {
+        display: none;
+      }
+      .clear-history {
+        background: transparent;
+        border: none;
+        color: var(--muted);
+        font-family: 'Inter', system-ui, sans-serif;
+        font-size: 0.8rem;
+        letter-spacing: 0.04em;
+        cursor: pointer;
+        padding: 0.5rem 0.75rem;
+        margin-top: 0.5rem;
+        transition: color 200ms ease;
+      }
+      .clear-history:hover,
+      .clear-history:focus-visible {
+        color: var(--sunrise);
+        outline: none;
+      }
+      .clear-history[hidden] {
+        display: none;
+      }
+      .card {
+        border: 1px solid var(--faint);
+        padding: 1rem 1.15rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.55rem;
+      }
+      .card.won {
+        border-color: var(--hairline);
+      }
+      .card-city {
+        font-size: 0.95rem;
+        color: var(--white);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .card.lost .card-city {
+        color: var(--muted);
+      }
+      .card-result {
+        font-family: 'JetBrains Mono', ui-monospace, monospace;
+        font-size: 0.85rem;
+        color: var(--sunrise);
+        letter-spacing: 0.04em;
+        flex-shrink: 0;
+      }
+      .card.lost .card-result {
+        color: var(--muted);
+      }
+      .card-grid {
+        font-family: 'JetBrains Mono', ui-monospace, monospace;
+        font-size: 0.85rem;
+        line-height: 1.5;
+        color: var(--white);
+      }
+      .card-grid span {
+        display: block;
+        letter-spacing: 0.04em;
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .back,
+        .guess-input,
+        .action,
+        .help {
+          transition: none;
+        }
+      }
+    </style>
+  </body>
+</html>

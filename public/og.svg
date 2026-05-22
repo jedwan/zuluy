@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <rect width="1200" height="630" fill="#0A1628"/>
+  <text x="600" y="340" font-family="Spectral, Georgia, 'Times New Roman', serif" font-weight="400" font-size="200" fill="#F4A261" text-anchor="middle" letter-spacing="-4">zuluy.</text>
+  <text x="600" y="410" font-family="Inter, system-ui, sans-serif" font-size="32" fill="#8a8377" text-anchor="middle" letter-spacing="2">a timezone guessing puzzle.</text>
+</svg>

@@ -1,0 +1,26 @@
+{
+  "name": "zuluy",
+  "version": "0.0.1",
+  "type": "module",
+  "private": true,
+  "description": "A timezone guessing puzzle. See plan at ~/.claude/plans/all-five-let-s-do-breezy-waffle.md.",
+  "scripts": {
+    "dev": "astro dev",
+    "build": "astro build",
+    "preview": "astro preview",
+    "check": "astro check",
+    "test": "vitest run",
+    "verify:cities": "tsx scripts/verify-cities.ts"
+  },
+  "dependencies": {
+    "astro": "^6.1.9",
+    "tz-lookup": "^6.1.25"
+  },
+  "devDependencies": {
+    "@astrojs/check": "^0.9.8",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.5",
+    "tsx": "^4.19.2"
+  }
+}
